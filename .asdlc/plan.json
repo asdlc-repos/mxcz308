@@ -1,0 +1,70 @@
+{
+  "strategy": "Bottom-Up",
+  "overview": "The leave-service has no dependencies and forms the foundation of the system, so it is built first. The leave-portal depends on leave-service for all API calls and cannot be meaningfully developed or tested without it, so it follows in Phase 2. This bottom-up ordering ensures each layer is ready before the layer above it is assembled.",
+  "phases": [
+    {
+      "phase": 1,
+      "name": "Foundation Services",
+      "description": "The leave-service is the sole backend and has no dependencies on other components. It must be implemented first as it owns all business logic, data storage, and API contracts that the frontend will consume.",
+      "components": [
+        {
+          "name": "leave-service",
+          "componentType": "service",
+          "language": "Go",
+          "deployment": "Docker",
+          "responsibilities": [
+            "Handle submission, retrieval, and status updates of employee leave requests",
+            "Enforce business rules including date-range validation, overlap detection, and balance sufficiency checks",
+            "Manage leave balances per employee and deduct approved leave from the appropriate balance",
+            "Support role-based filtering of leave requests for employees, managers, and HR admins",
+            "Expose a /health endpoint for Kubernetes readiness probes"
+          ],
+          "architectureContext": "This is the sole backend service in the system. It is called directly by the leave-portal for all data operations. It stores all state in-memory (maps with mutexes) and seeds initial employee, manager, and balance data at startup. Nothing depends on an external service — it is the system's source of truth.",
+          "keyConsiderations": [
+            "In-memory store must use sync.RWMutex correctly to avoid data races under concurrent requests — use read locks for GET operations and write locks for POST/PATCH/PUT.",
+            "Balance deduction must only occur when a request transitions to 'approved' via PATCH, not at submission time; guard against double-deduction if PATCH is called more than once.",
+            "Overlap detection must check all existing non-denied requests for the same employeeId where date ranges intersect before creating a new request.",
+            "Manager authorization in PATCH must verify that the reviewerId is registered as the direct manager of the leave request's employeeId — return 403 otherwise.",
+            "Multi-stage Dockerfile must produce a minimal scratch-based final image; ensure the binary is built with CGO_ENABLED=0 and GOOS=linux for compatibility with the scratch base."
+          ],
+          "apiContract": "openapi: 3.0.3\ninfo:\n  title: Leave Management API\n  version: 1.0.0\n  description: Backend API for WSO2 internal leave management system\nservers:\n  - url: http://localhost:9090\n    description: Development server\npaths:\n  /health:\n    get:\n      summary: Health check endpoint\n      operationId: healthCheck\n      responses:\n        '200':\n          description: Service is healthy\n          content:\n            application/json:\n              schema:\n                type: object\n                properties:\n                  status:\n                    type: string\n                    example: ok\n  /api/v1/leave-requests:\n    post:\n      summary: Submit a new leave request\n      operationId: createLeaveRequest\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema:\n              type: object\n              required:\n                - employeeId\n                - leaveType\n                - startDate\n                - endDate\n              properties:\n                employeeId:\n                  type: string\n                leaveType:\n                  type: string\n                  enum: [annual, sick, personal, unpaid]\n                startDate:\n                  type: string\n                  format: date\n                endDate:\n                  type: string\n                  format: date\n                reason:\n                  type: string\n      responses:\n        '201':\n          description: Leave request created\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/LeaveRequest'\n        '400':\n          description: Invalid request (overlapping dates, insufficient balance)\n        '500':\n          description: Server error\n    get:\n      summary: List leave requests\n      operationId: listLeaveRequests\n      parameters:\n        - name: employeeId\n          in: query\n          schema:\n            type: string\n        - name: managerId\n          in: query\n          schema:\n            type: string\n        - name: status\n          in: query\n          schema:\n            type: string\n            enum: [pending, approved, denied]\n      responses:\n        '200':\n          description: List of leave requests\n          content:\n            application/json:\n              schema:\n                type: array\n                items:\n                  $ref: '#/components/schemas/LeaveRequest'\n  /api/v1/leave-requests/{id}:\n    get:\n      summary: Get a specific leave request\n      operationId: getLeaveRequest\n      parameters:\n        - name: id\n          in: path\n          required: true\n          schema:\n            type: string\n      responses:\n        '200':\n          description: Leave request details\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/LeaveRequest'\n        '404':\n          description: Leave request not found\n    patch:\n      summary: Update leave request status (approve/deny)\n      operationId: updateLeaveRequestStatus\n      parameters:\n        - name: id\n          in: path\n          required: true\n          schema:\n            type: string\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema:\n              type: object\n              required:\n                - status\n                - reviewerId\n              properties:\n                status:\n                  type: string\n                  enum: [approved, denied]\n                reviewerId:\n                  type: string\n                comments:\n                  type: string\n      responses:\n        '200':\n          description: Leave request updated\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/LeaveRequest'\n        '403':\n          description: Unauthorized (not the manager)\n        '404':\n          description: Leave request not found\n  /api/v1/employees/{id}/balance:\n    get:\n      summary: Get employee leave balance\n      operationId: getLeaveBalance\n      parameters:\n        - name: id\n          in: path\n          required: true\n          schema:\n            type: string\n      responses:\n        '200':\n          description: Leave balance by type\n          content:\n            application/json:\n              schema:\n                type: object\n                properties:\n                  employeeId:\n                    type: string\n                  balances:\n                    type: array\n                    items:\n                      type: object\n                      properties:\n                        leaveType:\n                          type: string\n                        allocated:\n                          type: number\n                        used:\n                          type: number\n                        remaining:\n                          type: number\n        '404':\n          description: Employee not found\n    put:\n      summary: Set employee annual leave allocation (HR admin only)\n      operationId: setLeaveAllocation\n      parameters:\n        - name: id\n          in: path\n          required: true\n          schema:\n            type: string\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema:\n              type: object\n              required:\n                - leaveType\n                - allocated\n              properties:\n                leaveType:\n                  type: string\n                allocated:\n                  type: number\n      responses:\n        '200':\n          description: Allocation updated\n        '403':\n          description: Unauthorized (not HR admin)\ncomponents:\n  schemas:\n    LeaveRequest:\n      type: object\n      properties:\n        id:\n          type: string\n        employeeId:\n          type: string\n        leaveType:\n          type: string\n        startDate:\n          type: string\n          format: date\n        endDate:\n          type: string\n          format: date\n        reason:\n          type: string\n        status:\n          type: string\n          enum: [pending, approved, denied]\n        reviewerId:\n          type: string\n        reviewerComments:\n          type: string\n        createdAt:\n          type: string\n          format: date-time\n        updatedAt:\n          type: string\n          format: date-time",
+          "dependencies": []
+        }
+      ]
+    },
+    {
+      "phase": 2,
+      "name": "Frontend Application",
+      "description": "The leave-portal depends entirely on leave-service for its data. It is implemented after the backend is stable so API calls can be validated end-to-end during development.",
+      "components": [
+        {
+          "name": "leave-portal",
+          "componentType": "web-app",
+          "language": "TypeScript / React",
+          "deployment": "Docker",
+          "responsibilities": [
+            "Render an Employee Dashboard showing leave balances and submitted requests, with a form to submit new leave requests",
+            "Render a Manager Dashboard listing pending requests from direct reports with Approve/Deny actions",
+            "Render an HR Admin Panel allowing leave allocation updates per employee",
+            "Route between views based on the user role stored in localStorage and proxy all data operations to leave-service",
+            "Serve the compiled React SPA as static files via an Express server that also exposes a /health endpoint"
+          ],
+          "architectureContext": "The leave-portal is the only client-facing component. It communicates exclusively with leave-service (at http://leave-service:9090) via the browser's fetch API for all CRUD operations. It has no backend logic of its own — all validation and business rules are enforced by leave-service. It is accessed by end users on port 3000.",
+          "keyConsiderations": [
+            "The hard-coded userId and role in localStorage is a demo-only pattern; ensure the UI reads these values on every route render so switching roles in localStorage is reflected immediately without a full page reload.",
+            "All fetch calls to leave-service must handle non-2xx responses explicitly and surface human-readable error messages (e.g. 'Overlapping leave request exists', 'Insufficient balance') extracted from the response body.",
+            "The Express server.js must serve the Vite /dist output as static files and fall back to index.html for all non-/health routes to support React Router's client-side navigation.",
+            "The Dockerfile's builder stage must run `npm run build` against the correct Vite config; the runtime stage should only copy dist/ and server.js to keep the final image lean.",
+            "Date pickers in the leave submission form must enforce that endDate \u003e= startDate on the client side to provide fast feedback before the request is sent to leave-service."
+          ],
+          "apiContract": "openapi: 3.0.3\ninfo:\n  title: Leave Portal Frontend\n  version: 1.0.0\n  description: Static web application serving the leave management UI\nservers:\n  - url: http://localhost:3000\npaths:\n  /health:\n    get:\n      summary: Health check\n      responses:\n        '200':\n          description: Frontend is serving\n          content:\n            application/json:\n              schema:\n                type: object\n                properties:\n                  status:\n                    type: string\n                    example: ok",
+          "dependencies": [
+            "leave-service"
+          ]
+        }
+      ]
+    }
+  ],
+  "sourceSpec": "spec-v1",
+  "sourceDesign": "design-v1"
+}
